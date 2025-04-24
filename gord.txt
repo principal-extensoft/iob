@@ -1,0 +1,428 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
+
+namespace Consolo
+{
+    class Program
+    {
+        // Async Main is supported when you return Task or Task<int>
+        static async Task Main(string[] args)
+        {
+            // 1. Prepare tasks (reuse the example from before)
+            HttpClient httpClient = new HttpClient();
+            string connStr = "Server=(local);MultipleActiveResultSets=true;Database=demo;Integrated Security=SSPI;encrypt=false";
+
+            var tasks = new List<IIoBoundTask>
+            {
+                //new HttpTask(httpClient, "https://api.service1.com/endpoint1"),
+                //new HttpTask(httpClient, "https://api.service1.com/endpoint2"),
+                //new HttpTask(httpClient, "https://api.service2.com/endpoint1"),
+
+                new SqlCommandTask(connStr, "WAITFOR DELAY '00:00:03'; SELECT 5 AS CNT;"),
+                new SqlCommandTask(connStr, "WAITFOR DELAY '00:00:02'; SELECT 5 AS CNT;"),
+                new SqlCommandTask(connStr, "WAITFOR DELAY '00:00:04'; SELECT 5 AS CNT;"),
+                new SqlCommandTask(connStr, "WAITFOR DELAY '00:00:05'; SELECT 5 AS CNT;"),
+                new SqlCommandTask(connStr, "WAITFOR DELAY '00:00:06'; SELECT 5 AS CNT;")
+            };
+
+            // 2. Logger
+            using var loggerFactory = LoggerFactory.Create(builder =>
+                builder.AddSimpleConsole());
+            ILogger logger = loggerFactory.CreateLogger<Program>();
+
+            // 3. Define processing delegate
+            string ProcessResults(IEnumerable<IoResult> results)
+            {
+                int total = results.Count();
+                int ok = results.Count(r => r.IsSuccess);
+                return $"Total={total}, Success={ok}, Failures={total - ok}";
+            }
+
+            // 4. Run and await
+            var (summary, stats) = await TaskMaster
+                .ExecuteTasksWithStats<string>(
+                    tasks,
+                    ProcessResults,
+                    CancellationToken.None,
+                    logger);
+
+            // 5. Output
+            Console.WriteLine("Summary: " + summary);
+            Console.WriteLine("Stats:");
+            foreach (DataRow row in stats.Rows)
+            {
+                Console.WriteLine(
+                  $"{row["TaskType"],-30} {row["ElapsedTime"]}");
+            }
+        }
+    }
+    #region Common Result Types
+
+    /// <summary>
+    /// Represents the common result of an I/O operation.
+    /// </summary>
+    public interface IoResult
+    {
+        bool IsSuccess { get; }
+        string ErrorMessage { get; }
+    }
+
+    /// <summary>
+    /// Result type for HTTP operations.
+    /// </summary>
+    public class HttpResult : IoResult
+    {
+        public bool IsSuccess { get; set; }
+        public string ErrorMessage { get; set; }
+        public string Content { get; set; }
+        public System.Net.HttpStatusCode StatusCode { get; set; }
+    }
+
+    /// <summary>
+    /// Result type for SQL operations.
+    /// </summary>
+    public class SqlResult : IoResult
+    {
+        public bool IsSuccess { get; set; }
+        public string ErrorMessage { get; set; }
+        public DataTable Data { get; set; }
+    }
+
+    #endregion
+
+    #region Interfaces with Timing Properties
+
+    /// <summary>
+    /// Base interface for I/O-bound tasks. Includes timing properties.
+    /// </summary>
+    public interface IIoBoundTask
+    {
+        /// <summary>
+        /// A string discriminator that identifies the type of I/O operation.
+        /// </summary>
+        string Type { get; }
+
+        /// <summary>
+        /// The time when task execution started.
+        /// </summary>
+        DateTime? StartTime { get; set; }
+
+        /// <summary>
+        /// The time when task execution finished.
+        /// </summary>
+        DateTime? EndTime { get; set; }
+
+        /// <summary>
+        /// Executes the I/O operation asynchronously.
+        /// </summary>
+        Task<IoResult> ExecuteAsync(CancellationToken cancellationToken, ILogger logger);
+    }
+
+    /// <summary>
+    /// Generic version for I/O-bound tasks that return a strongly typed result.
+    /// </summary>
+    /// <typeparam name="T">A type that implements IoResult.</typeparam>
+    public interface IIoBoundTask<T> : IIoBoundTask where T : IoResult
+    {
+        new string Type { get; }
+        new Task<T> ExecuteAsync(CancellationToken cancellationToken, ILogger logger);
+    }
+
+    #endregion
+
+    #region Concrete Task Implementations
+
+    /// <summary>
+    /// Implements an I/O-bound task that issues an HTTP call.
+    /// </summary>
+    public class HttpTask : IIoBoundTask<HttpResult>
+    {
+        public string Type => "Http";
+        public DateTime? StartTime { get; set; }
+        public DateTime? EndTime { get; set; }
+
+        public string Url { get; }
+        public HttpMethod Method { get; }
+        public HttpContent Content { get; }
+
+        private readonly HttpClient _client;
+
+        public HttpTask(HttpClient client, string url, HttpMethod method = null, HttpContent content = null)
+        {
+            _client = client ?? throw new ArgumentNullException(nameof(client));
+            Url = url ?? throw new ArgumentNullException(nameof(url));
+            Method = method ?? HttpMethod.Get;
+            Content = content;
+        }
+
+        public async Task<HttpResult> ExecuteAsync(CancellationToken cancellationToken, ILogger logger)
+        {
+            StartTime = DateTime.UtcNow;
+            var request = new HttpRequestMessage(Method, Url);
+            if (Content != null)
+            {
+                request.Content = Content;
+            }
+
+            try
+            {
+                HttpResponseMessage response = await _client.SendAsync(request, cancellationToken);
+                string responseContent = await response.Content.ReadAsStringAsync();
+                EndTime = DateTime.UtcNow;
+                return new HttpResult
+                {
+                    StatusCode = response.StatusCode,
+                    IsSuccess = response.IsSuccessStatusCode,
+                    Content = responseContent,
+                    ErrorMessage = response.IsSuccessStatusCode ? null : $"HTTP call failed with status {response.StatusCode}"
+                };
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, $"Error during HTTP call to {Url}");
+                EndTime = DateTime.UtcNow;
+                return new HttpResult
+                {
+                    IsSuccess = false,
+                    ErrorMessage = ex.Message
+                };
+            }
+        }
+
+        async Task<IoResult> IIoBoundTask.ExecuteAsync(CancellationToken cancellationToken, ILogger logger)
+        {
+            return await ExecuteAsync(cancellationToken, logger);
+        }
+    }
+
+    /// <summary>
+    /// Implements an I/O-bound task that executes a SQL command and retrieves the result via a DataReader.
+    /// </summary>
+    public class SqlCommandTask : IIoBoundTask<SqlResult>
+    {
+        public string Type => "Sql";
+        public DateTime? StartTime { get; set; }
+        public DateTime? EndTime { get; set; }
+
+        public string CommandText { get; }
+        public CommandType CommandType { get; }
+        public IEnumerable<SqlParameter> Parameters { get; }
+
+        private readonly string _connectionString;
+
+        public SqlCommandTask(string connectionString, string commandText, CommandType commandType = CommandType.Text, IEnumerable<SqlParameter> parameters = null)
+        {
+            _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+            CommandText = commandText ?? throw new ArgumentNullException(nameof(commandText));
+            CommandType = commandType;
+            Parameters = parameters ?? new List<SqlParameter>();
+        }
+
+        public async Task<SqlResult> ExecuteAsync(CancellationToken cancellationToken, ILogger logger)
+        {
+            StartTime = DateTime.UtcNow;
+            var result = new SqlResult();
+            try
+            {
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    await connection.OpenAsync(cancellationToken);
+                    using (var command = new SqlCommand(CommandText, connection))
+                    {
+                        command.CommandType = CommandType;
+                        if (Parameters.Any())
+                        {
+                            command.Parameters.AddRange(Parameters.ToArray());
+                        }
+                        using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+                        {
+                            var dataTable = new DataTable();
+                            dataTable.Load(reader);
+                            result.Data = dataTable;
+                            result.IsSuccess = true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Error executing SQL command.");
+                result.IsSuccess = false;
+                result.ErrorMessage = ex.Message;
+            }
+            EndTime = DateTime.UtcNow;
+            return result;
+        }
+
+        async Task<IoResult> IIoBoundTask.ExecuteAsync(CancellationToken cancellationToken, ILogger logger)
+        {
+            return await ExecuteAsync(cancellationToken, logger);
+        }
+    }
+
+    #endregion
+
+    #region TaskMaster with Execution Statistics
+
+    /// <summary>
+    /// Provides methods to execute collections of I/O-bound tasks concurrently and capture execution statistics.
+    /// </summary>
+    public static class TaskMaster
+    {
+        /// <summary>
+        /// Executes a heterogeneous collection of I/O-bound tasks concurrently, processes the results,
+        /// and returns both the processing output and a DataTable of execution statistics.
+        /// </summary>
+        /// <param name="tasks">The collection of tasks to execute.</param>
+        /// <param name="process">Delegate that processes the aggregated IoResult objects.</param>
+        /// <param name="cancellationToken">Cancellation token for the tasks.</param>
+        /// <param name="logger">Logger used for logging in the tasks.</param>
+        /// <typeparam name="TResult">The type produced by the process delegate.</typeparam>
+        /// <returns>A tuple containing the processing output and a DataTable of statistics.</returns>
+        public static async Task<(TResult result, DataTable stats)> ExecuteTasksWithStats<TResult>(
+            IEnumerable<IIoBoundTask> tasks,
+            Func<IEnumerable<IoResult>, TResult> process,
+            CancellationToken cancellationToken,
+            ILogger logger)
+        {
+            DateTime overallStart = DateTime.UtcNow;
+
+            // Start executing all tasks concurrently.
+            IEnumerable<Task<IoResult>> executionTasks = tasks.Select(task => task.ExecuteAsync(cancellationToken, logger));
+            IoResult[] results = await Task.WhenAll(executionTasks);
+            DateTime tasksEnd = DateTime.UtcNow;
+
+            // Time the aggregation processing.
+            DateTime aggregationStart = DateTime.UtcNow;
+            TResult result = process(results);
+            DateTime aggregationEnd = DateTime.UtcNow;
+
+            // Mark overall execution end.
+            DateTime overallEnd = DateTime.UtcNow;
+
+            // Build a DataTable with statistics.
+            DataTable statsTable = BuildStatisticsTable(
+                tasks,
+                overallStart,
+                tasksEnd,
+                overallEnd,
+                aggregationStart,
+                aggregationEnd);
+
+            return (result, statsTable);
+        }
+
+        /// <summary>
+        /// Executes a homogeneous collection of I/O-bound tasks concurrently, processes the results,
+        /// and returns both the processing output and a DataTable of execution statistics.
+        /// </summary>
+        /// <param name="tasks">The collection of typed tasks to execute.</param>
+        /// <param name="process">Delegate that processes the aggregated results.</param>
+        /// <param name="cancellationToken">Cancellation token for the tasks.</param>
+        /// <param name="logger">Logger used for logging in the tasks.</param>
+        /// <typeparam name="T">The specific IoResult type returned by the tasks.</typeparam>
+        /// <typeparam name="TResult">The type produced by the process delegate.</typeparam>
+        /// <returns>A tuple containing the processing output and a DataTable of statistics.</returns>
+        public static async Task<(TResult result, DataTable stats)> ExecuteTasksWithStats<T, TResult>(
+            IEnumerable<IIoBoundTask<T>> tasks,
+            Func<IEnumerable<T>, TResult> process,
+            CancellationToken cancellationToken,
+            ILogger logger)
+            where T : IoResult
+        {
+            DateTime overallStart = DateTime.UtcNow;
+
+            IEnumerable<Task<T>> executionTasks = tasks.Select(task => task.ExecuteAsync(cancellationToken, logger));
+            T[] results = await Task.WhenAll(executionTasks);
+            DateTime tasksEnd = DateTime.UtcNow;
+
+            DateTime aggregationStart = DateTime.UtcNow;
+            TResult result = process(results);
+            DateTime aggregationEnd = DateTime.UtcNow;
+
+            DateTime overallEnd = DateTime.UtcNow;
+
+            DataTable statsTable = BuildStatisticsTable(
+                tasks.Cast<IIoBoundTask>(),
+                overallStart,
+                tasksEnd,
+                overallEnd,
+                aggregationStart,
+                aggregationEnd);
+
+            return (result, statsTable);
+        }
+
+        /// <summary>
+        /// Builds a DataTable that includes individual task execution statistics and overall execution timings.
+        /// </summary>
+        /// <param name="tasks">The executed tasks.</param>
+        /// <param name="overallStart">When overall execution started.</param>
+        /// <param name="tasksEnd">When all tasks finished execution.</param>
+        /// <param name="overallEnd">When overall execution completed.</param>
+        /// <param name="aggregationStart">When aggregation processing started.</param>
+        /// <param name="aggregationEnd">When aggregation processing ended.</param>
+        /// <returns>A DataTable containing statistics.</returns>
+        private static DataTable BuildStatisticsTable(
+            IEnumerable<IIoBoundTask> tasks,
+            DateTime overallStart,
+            DateTime tasksEnd,
+            DateTime overallEnd,
+            DateTime aggregationStart,
+            DateTime aggregationEnd)
+        {
+            DataTable table = new DataTable("ExecutionStatistics");
+            table.Columns.Add("TaskType", typeof(string));
+            table.Columns.Add("StartTime", typeof(DateTime));
+            table.Columns.Add("EndTime", typeof(DateTime));
+            table.Columns.Add("ElapsedTime", typeof(TimeSpan));
+
+            // Record individual task statistics.
+            foreach (var task in tasks)
+            {
+                DateTime start = task.StartTime ?? DateTime.MinValue;
+                DateTime end = task.EndTime ?? DateTime.MinValue;
+                TimeSpan elapsed = (task.StartTime.HasValue && task.EndTime.HasValue)
+                    ? task.EndTime.Value - task.StartTime.Value
+                    : TimeSpan.Zero;
+                table.Rows.Add(task.Type, start, end, elapsed);
+            }
+
+            // Overall tasks execution row (from overall start until all tasks finish).
+            DataRow overallTasksRow = table.NewRow();
+            overallTasksRow["TaskType"] = "Overall Tasks Execution";
+            overallTasksRow["StartTime"] = overallStart;
+            overallTasksRow["EndTime"] = tasksEnd;
+            overallTasksRow["ElapsedTime"] = tasksEnd - overallStart;
+            table.Rows.Add(overallTasksRow);
+
+            // Aggregation processing row.
+            DataRow aggregationRow = table.NewRow();
+            aggregationRow["TaskType"] = "Aggregation Processing";
+            aggregationRow["StartTime"] = aggregationStart;
+            aggregationRow["EndTime"] = aggregationEnd;
+            aggregationRow["ElapsedTime"] = aggregationEnd - aggregationStart;
+            table.Rows.Add(aggregationRow);
+
+            // Overall execution row (including tasks and aggregation).
+            DataRow overallRow = table.NewRow();
+            overallRow["TaskType"] = "Overall Execution (Including Aggregation)";
+            overallRow["StartTime"] = overallStart;
+            overallRow["EndTime"] = overallEnd;
+            overallRow["ElapsedTime"] = overallEnd - overallStart;
+            table.Rows.Add(overallRow);
+
+            return table;
+        }
+    }
+
+    #endregion
+
+}
